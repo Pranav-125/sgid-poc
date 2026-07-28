@@ -16,11 +16,7 @@ from snntorch import surrogate
 from collections import deque
 from src.filters.base_filter import BaseFilter
 class SpikingNet(nn.Module):
-    """
-    Small SNN: input layer -> LIF -> hidden layer -> LIF -> output LIF neuron.
-    Uses surrogate gradients so it can be trained with normal backprop,
-    since spikes themselves aren't differentiable.
-    """
+   
     def __init__(self, input_dim=5, hidden_dim=8, beta=0.9):
         super().__init__()
         spike_grad = surrogate.fast_sigmoid()

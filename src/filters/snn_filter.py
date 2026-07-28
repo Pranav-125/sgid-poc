@@ -180,6 +180,6 @@ class SNNFilter(BaseFilter):
         return should_escalate, float(spike_score)
 
     def name(self):
-        return "snn";
+        return "snn"
 
 

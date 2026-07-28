@@ -1,66 +1,133 @@
+"""
+autoencoder_filter.py
+
+Purpose: Detects anomalies using a small neural network (Autoencoder)
+that learns to compress and reconstruct "normal" data. Values that
+reconstruct poorly are flagged as anomalous.
+Implements the BaseFilter interface so it's swappable with the others.
+"""
+
 import numpy as np
-import torch 
+import torch
 import torch.nn as nn
 from collections import deque
-from src.filters.base_filter import BaseFliter
+from src.filters.base_filter import BaseFilter
+
+
 class SimpleAutoencoder(nn.Module):
-    def  __init__(self,input_dim=5,bottleneck_dim=2):
+    """
+    A small feedforward autoencoder.
+    Input -> compress down to a smaller 'bottleneck' -> reconstruct back.
+    """
+    def __init__(self, input_dim=5, bottleneck_dim=2):
         super().__init__()
-        self.encoder=nn.Sequential(nn.Linear(input_dim,4),nn.ReLU(),nn.Linear(4,bottleneck_dim),nn.ReLU())
-        self.decoder=nn.Sequential(nn.Linear(bottleneck_dim,4),nn.ReLU(),nn.Linear(4,input_dim))
+        # Encoder: compresses input down to a smaller representation
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 4),
+            nn.ReLU(),
+            nn.Linear(4, bottleneck_dim),
+            nn.ReLU()
+        )
+        # Decoder: tries to rebuild the original input from that compressed form
+        self.decoder = nn.Sequential(
+            nn.Linear(bottleneck_dim, 4),
+            nn.ReLU(),
+            nn.Linear(4, input_dim)
+        )
 
-    def forward(self,x):
-        compressed=self.encoder(x)
-        reconstructed=self.decoder(compressed)
+    def forward(self, x):
+        compressed = self.encoder(x)
+        reconstructed = self.decoder(compressed)
         return reconstructed
-    class AutoencoderFilter(BaseFilter):
-        def __init__(self,window_size=5,threshold=None,epochs=50,retrain_every=200):
-            self.window_size=window_size
-            self.threshold=threshold
-            self.epochs=epochs
-            self.retrain_every=retrain_every
-            self.model=SimpleAutoencoder(input_dim=window_size)
-            self.buffer=deque(maxlen=window_size)
-            self.values_since_retrain=0
 
-        def _make_windows(self,data):
-            windows=[]
-            for i in range(len(data)-self.window_size+1):
-                windows.append(data[i:i+self.window_size])
-            return np.array(windows,dtype=np.float32)
-        def fit(self,baseline_data):
-            windows=self._make_windows(baseline_data)
-            X=torch.tensor(windows)
 
-            optimizer=torch.optim.Adam(self.model.paramters(),lr=0.01)
-            loss_fn=nn.MSELoss()
+class AutoencoderFilter(BaseFilter):
+    def __init__(self, window_size=5, threshold=None, epochs=50, retrain_every=200):
+        """
+        window_size:    how many recent values form one "sample" fed to the model
+                         (autoencoder looks at a short sequence, not just 1 value)
+        threshold:       reconstruction error above this = anomaly.
+                         If None, it's calculated automatically during fit().
+        epochs:          training iterations when fitting on baseline data
+        retrain_every:   how many new values before refitting on recent data
+        """
+        self.window_size = window_size
+        self.threshold = threshold
+        self.epochs = epochs
+        self.retrain_every = retrain_every
 
-            self.model.train()
-            for _ in range(self.epochs):
-                optimizer.zero_grad()
-                reconstructed=self.model(X)
-                loss=loss_fn(reconstructed,X)
-                loss.backward()
-                optimizer.step()
+        self.model = SimpleAutoencoder(input_dim=window_size)
+        self.buffer = deque(maxlen=window_size)
+        self.values_since_retrain = 0
 
-                self.model.eval()
-                with torch.no_grad():
-                    reconstructed=self.model(X)
-                    errors=torch.mean((reconstructed-X)**2,dim=1).numpy()
-                self.threshold=float(np.mean(errors)+3*np.std(errors))
+    def _make_windows(self, data):
+        """Turn a flat list of values into overlapping windows of size window_size."""
+        windows = []
+        for i in range(len(data) - self.window_size + 1):
+            windows.append(data[i:i + self.window_size])
+        return np.array(windows, dtype=np.float32)
 
-                for value in baseline_data[-self.window_size:]:
-                    self.buffer.append(value)
+    def fit(self, baseline_data):
+        """
+        Train the autoencoder to reconstruct normal windows accurately,
+        then set the anomaly threshold based on typical reconstruction error.
+        """
+        windows = self._make_windows(baseline_data)
+        X = torch.tensor(windows)
 
-        def detect(self,value,timestamp=None):
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=0.01)
+        loss_fn = nn.MSELoss()
+
+        self.model.train()
+        for _ in range(self.epochs):
+            optimizer.zero_grad()
+            reconstructed = self.model(X)
+            loss = loss_fn(reconstructed, X)
+            loss.backward()
+            optimizer.step()
+
+        # Set threshold automatically: mean + 3*std of reconstruction errors
+        # on the baseline data itself (errors we KNOW are "normal")
+        self.model.eval()
+        with torch.no_grad():
+            reconstructed = self.model(X)
+            errors = torch.mean((reconstructed - X) ** 2, dim=1).numpy()
+        self.threshold = float(np.mean(errors) + 3 * np.std(errors))
+
+        # Seed the rolling buffer with the tail of baseline data
+        for value in baseline_data[-self.window_size:]:
             self.buffer.append(value)
-            if len(self.buffer)<self.window_size:
-                return False,0.0
 
-            window=np.array(self.buffer,dtype=np.float32)
-            X=torch.tensor(window).unsqueeze(0)
-            
+    def detect(self, value, timestamp=None):
+        """
+        Adds the new value to a short rolling window, reconstructs that
+        window, and checks how far off the reconstruction is.
+        Returns (should_escalate: bool, score: float)
+        """
+        self.buffer.append(value)
 
+        if len(self.buffer) < self.window_size:
+            return False, 0.0
+
+        window = np.array(self.buffer, dtype=np.float32)
+        X = torch.tensor(window).unsqueeze(0)  # shape: (1, window_size)
+
+        self.model.eval()
+        with torch.no_grad():
+            reconstructed = self.model(X)
+            error = torch.mean((reconstructed - X) ** 2).item()
+
+        should_escalate = error > self.threshold
+
+        self.values_since_retrain += 1
+        if self.values_since_retrain >= self.retrain_every:
+            self.fit(list(self.buffer))
+            self.values_since_retrain = 0
+
+        return should_escalate, error
+
+    def name(self):
+        return "autoencoder"
 
 
 
